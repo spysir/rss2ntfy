@@ -8,236 +8,201 @@ import os
 import logging
 import signal
 import sys
-from bs4 import BeautifulSoup
 import time
 from datetime import datetime
 import zoneinfo
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse, urlunparse
 
 # --- Configuration ---
-# Read environment variables with default values
 CONFIG_DIR = os.getenv("CONFIG_DIR", "configs")
 BASE_URL = os.getenv("NTFY_URL", "https://ntfy.sh")
 NTFY_TOKEN = os.getenv("NTFY_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "rss_history.db")
 TZ_NAME = os.getenv("TZ", "UTC")
 DEFAULT_PRIORITY = "3"
-USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+USER_AGENT = os.getenv("USER_AGENT",
+                       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-# Logging setup
-def get_now():
-    """Returns the current time in the configured timezone."""
-    return datetime.now(zoneinfo.ZoneInfo(TZ_NAME))
 
+# Logging Setup
 class TZFormatter(logging.Formatter):
-    """Custom logging formatter that respects the configured timezone."""
     def formatTime(self, record, datefmt=None):
         dt = datetime.fromtimestamp(record.created, zoneinfo.ZoneInfo(TZ_NAME))
-        if datefmt:
-            return dt.strftime(datefmt)
-        return dt.isoformat(sep=' ', timespec='seconds')
+        return dt.strftime(datefmt) if datefmt else dt.isoformat(sep=' ', timespec='seconds')
 
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler("rss_bridge.log", encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-for handler in logging.root.handlers:
-    handler.setFormatter(TZFormatter('%(asctime)s - [%(levelname)s] - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
 
-db_conn = None
+logging.basicConfig(level=logging.INFO,
+                    handlers=[logging.FileHandler("rss_bridge.log", encoding='utf-8'), logging.StreamHandler()])
+for h in logging.root.handlers:
+    h.setFormatter(TZFormatter('%(asctime)s - [%(levelname)s] - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+
+
+class FeedEngine:
+    def __init__(self):
+        self.db_conn = self._init_db()
+        self.session = requests.Session()
+
+    def _init_db(self):
+        os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL;")  # Senior practice for better concurrency
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS seen_entries (hash TEXT PRIMARY KEY, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        conn.commit()
+        return conn
+
+    def clean_url(self, url):
+        """Strips tracking parameters (UTM) to ensure stable hashing."""
+        u = urlparse(url)
+        return urlunparse((u.scheme, u.netloc, u.path, '', '', ''))
+
+    def get_now(self):
+        return datetime.now(zoneinfo.ZoneInfo(TZ_NAME))
+
+    def get_dynamic_priority(self, f_conf):
+        """Calculates priority based on time-of-day (Quiet Hours)."""
+        prio = f_conf.get('priority', DEFAULT_PRIORITY)
+        schedule = f_conf.get('schedule', {})
+        if 'quiet_hours' in schedule:
+            now_hour = self.get_now().hour
+            try:
+                start, end = map(int, re.findall(r'\d+', schedule['quiet_hours']))
+                is_quiet = now_hour >= start or now_hour < end if start > end else start <= now_hour < end
+                if is_quiet:
+                    return schedule.get('quiet_priority', 1)
+            except ValueError:
+                logging.error(f"Invalid quiet_hours format for {f_conf.get('name')}")
+        return prio
+
+    def should_filter(self, entry, f_conf):
+        """Advanced content filtering using Regex."""
+        filters = f_conf.get('filters', {})
+        text_to_scan = f"{entry.get('title', '')} {entry.get('summary', '')}".lower()
+
+        if 'exclude_regex' in filters and re.search(filters['exclude_regex'], text_to_scan, re.IGNORECASE):
+            return True  # Filter out
+        if 'include_regex' in filters and not re.search(filters['include_regex'], text_to_scan, re.IGNORECASE):
+            return True  # Filter out because it doesn't match inclusion
+        return False
+
+    def clean_html_content(self, html_content, entry):
+        if not html_content: return "", None
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        # Image extraction logic
+        img_url = None
+        if 'media_content' in entry and entry.media_content:
+            img_url = entry.media_content[0]['url']
+        elif 'enclosures' in entry and entry.enclosures:
+            img_url = entry.enclosures[0]['href']
+        else:
+            img_tag = soup.find("img")
+            if img_tag and img_tag.get("src"): img_url = img_tag["src"]
+
+        text = re.sub(r'\s+', ' ', soup.get_text(separator=" ")).strip()
+        return (text[:250] + '...') if len(text) > 250 else text, img_url
+
+    def send_ntfy(self, entry, f_conf, topic, priority, delay_str):
+        title = entry.get("title", "No Title")
+        link = entry.get("link", "#")
+        content = entry.get("content", [{"value": entry.get("summary", "")}])[0].value
+
+        short_desc, image_url = self.clean_html_content(content, entry)
+
+        headers = {
+            "Authorization": f"Bearer {NTFY_TOKEN}",
+            "User-Agent": USER_AGENT,
+            "Title": title.encode('utf-8'),
+            "Click": link,
+            "Markdown": "yes",
+            "Tags": "newspaper",
+            "Priority": str(priority)
+        }
+        if delay_str: headers["Delay"] = delay_str
+        if f_conf.get('icon'): headers["Icon"] = f_conf['icon']
+        if image_url: headers["Attach"] = image_url
+
+        message = f"**Source:** {f_conf['name']}\n\n{short_desc}\n\n[Read on Website]({link})"
+
+        try:
+            r = self.session.post(f"{BASE_URL}/{topic}", data=message.encode('utf-8'), headers=headers, timeout=20)
+            r.raise_for_status()
+            logging.info(f"Sent: [{f_conf['name']}] {title} (P:{priority})")
+        except Exception as e:
+            logging.error(f"Ntfy error: {e}")
+
+    def sync(self):
+        logging.info("Sync cycle started...")
+        if not os.path.exists(CONFIG_DIR):
+            logging.error("Config dir missing.")
+            return
+
+        cursor = self.db_conn.cursor()
+        config_files = sorted([f for f in os.listdir(CONFIG_DIR) if f.endswith('.json')])
+
+        for filename in config_files:
+            topic = os.path.splitext(filename)[0]
+            try:
+                with open(os.path.join(CONFIG_DIR, filename), 'r', encoding='utf-8') as f:
+                    feeds = json.load(f)
+
+                for f_conf in feeds:
+                    source_name = f_conf.get('name', 'Unknown')
+                    feed = feedparser.parse(f_conf['url'])
+                    sent_count = 0
+
+                    priority = self.get_dynamic_priority(f_conf)
+
+                    for entry in feed.entries:
+                        if sent_count >= 3: break  # Batch limit
+
+                        if self.should_filter(entry, f_conf):
+                            continue
+
+                        clean_link = self.clean_url(entry.get('link', ''))
+                        entry_id = entry.get('id', clean_link)
+                        entry_hash = hashlib.sha256(f"{topic}_{entry_id}".encode()).hexdigest()
+
+                        cursor.execute("SELECT 1 FROM seen_entries WHERE hash=?", (entry_hash,))
+                        if not cursor.fetchone():
+                            # Flood protection delay
+                            delay = f"{sent_count * 5 + 5}m" if int(priority) < 4 else None
+
+                            self.send_ntfy(entry, f_conf, topic, priority, delay)
+                            cursor.execute("INSERT INTO seen_entries (hash) VALUES (?)", (entry_hash,))
+                            self.db_conn.commit()
+                            sent_count += 1
+
+                    if sent_count > 0:
+                        logging.info(f"Processed {source_name}: {sent_count} new items.")
+
+            except Exception as e:
+                logging.error(f"Failed config {filename}: {e}")
+
+    def close(self):
+        self.db_conn.close()
+
+
+# --- Global Control ---
+engine = FeedEngine()
 
 
 def signal_handler(sig, frame):
-    """Handles termination signals for safe database closure."""
-    global db_conn
-    logging.info("Termination signal received. Closing database...")
-    if db_conn:
-        try:
-            db_conn.close()
-        except Exception:
-            pass
+    logging.info("Shutdown signal received.")
+    engine.close()
     sys.exit(0)
 
 
-# Register signal handlers
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-
-def init_db():
-    """Initializes the SQLite database for storing seen entries."""
-    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
-    if not os.path.exists(db_dir):
-        os.makedirs(db_dir, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS seen_entries (hash TEXT PRIMARY KEY, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
-    conn.commit()
-    return conn
-
-
-def format_local_date(entry):
-    """Formats the feed entry date to a readable local time based on TZ."""
-    try:
-        parsed_time = entry.get("published_parsed", entry.get("updated_parsed"))
-        if parsed_time:
-            # Convert feed time (usually UTC) to local timezone
-            dt_utc = datetime.fromtimestamp(time.mktime(parsed_time), zoneinfo.ZoneInfo("UTC"))
-            local_dt = dt_utc.astimezone(zoneinfo.ZoneInfo(TZ_NAME))
-            return local_dt.strftime('%Y-%m-%d %H:%M:%S')
-    except Exception:
-        pass
-    return entry.get("published", entry.get("updated", "Unknown date"))
-
-
-def clean_html_content(html_content, entry):
-    """Cleans HTML content, extracts description and potential image."""
-    if not html_content:
-        return "", None
-    soup = BeautifulSoup(html_content, "html.parser")
-
-    # Image extraction based on media_content, enclosures or img tag
-    img_url = None
-    if 'media_content' in entry and len(entry.media_content) > 0:
-        img_url = entry.media_content[0]['url']
-    elif 'enclosures' in entry and len(entry.enclosures) > 0:
-        img_url = entry.enclosures[0]['href']
-    else:
-        img_tag = soup.find("img")
-        if img_tag and img_tag.has_attr("src"):
-            img_url = img_tag["src"]
-
-    text = soup.get_text(separator=" ")
-    text = re.sub(r'\s+', ' ', text).strip()
-    short_desc = (text[:250] + '...') if len(text) > 250 else text
-    return short_desc, img_url
-
-
-def send_ntfy(session, entry, source_name, custom_icon, topic, priority, delay_str):
-    """Sends a notification to the ntfy server."""
-    title = entry.get("title", "No Title")
-    link = entry.get("link", "#")
-    content = entry.get("summary", "")
-    if entry.get("content"):
-        content = entry.content[0].value
-
-    short_desc, image_url = clean_html_content(content, entry)
-    local_date_str = format_local_date(entry)
-
-    headers = {
-        "Authorization": f"Bearer {NTFY_TOKEN}",
-        "User-Agent": USER_AGENT,
-        "Title": title.encode('utf-8'),
-        "Click": link,
-        "Markdown": "yes",
-        "Tags": "newspaper",
-        "Priority": str(priority),
-        "X-Publish-Date": local_date_str
-    }
-
-    if delay_str:
-        headers["Delay"] = delay_str
-    if custom_icon:
-        headers["Icon"] = custom_icon
-    if image_url:
-        headers["Attach"] = image_url
-
-    message = f"**Source:** {source_name}\n**Local Time:** {local_date_str}\n\n{short_desc}\n\n[Read on Website]({link})"
-
-    try:
-        r = session.post(f"{BASE_URL}/{topic}", data=message.encode('utf-8'), headers=headers, timeout=20)
-        r.raise_for_status()
-        logging.info(f"Notification sent: [{source_name}] - {title} [P:{priority}]")
-    except Exception as e:
-        logging.error(f"Error during ntfy dispatch: {e}")
-
-
-def process_config_file(session, file_path, cursor, conn):
-    """Processes a configuration JSON file containing feeds."""
-    topic = os.path.splitext(os.path.basename(file_path))[0]
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            feeds = json.load(f)
-    except Exception as e:
-        logging.error(f"Error loading configuration ({file_path}): {e}")
-        return
-
-    for f_conf in feeds:
-        source_name = f_conf.get('name', 'Unknown')
-        try:
-            logging.info(f"Checking feed: {source_name} ({f_conf['url']})")
-            feed = feedparser.parse(f_conf['url'])
-            prio = f_conf.get('priority', DEFAULT_PRIORITY)
-            sent_in_batch = 0
-            new_entries_found = 0
-
-            for entry in feed.entries:
-                # Send at most 3 new entries per feed per run
-                if sent_in_batch >= 3:
-                    logging.warning(f"Batch limit reached for {source_name}. Skipping remaining entries.")
-                    break
-
-                # Robust entry identification
-                entry_id = entry.get('id', entry.get('link', 'unknown_id'))
-                entry_hash = hashlib.sha256(f"{topic}_{entry_id}".encode()).hexdigest()
-
-                cursor.execute("SELECT 1 FROM seen_entries WHERE hash=?", (entry_hash,))
-                if not cursor.fetchone():
-                    # Calculate delay based on priority (flood protection)
-                    p = int(prio)
-                    delay = None
-                    if p < 5:
-                        if p == 4:
-                            delay = f"{sent_in_batch * 30 + 10}s"
-                        elif p == 3:
-                            delay = f"{sent_in_batch * 5 + 5}m"
-                        else:
-                            delay = f"{sent_in_batch * 10 + 15}m"
-
-                    send_ntfy(session, entry, f_conf['name'], f_conf.get('icon'), topic, prio, delay)
-
-                    cursor.execute("INSERT INTO seen_entries (hash) VALUES (?)", (entry_hash,))
-                    conn.commit()
-                    sent_in_batch += 1
-                    new_entries_found += 1
-            
-            if new_entries_found == 0:
-                logging.info(f"No new entries for {source_name}.")
-            else:
-                logging.info(f"Finished {source_name}: {new_entries_found} new notifications sent.")
-
-        except Exception as e:
-            logging.error(f"Error processing feed ({f_conf.get('name', 'Unknown')}): {e}")
-
-
-def main():
-    """Main execution cycle that iterates over configuration files."""
-    global db_conn
-    if not os.path.exists(CONFIG_DIR):
-        logging.error(f"Configuration directory '{CONFIG_DIR}' not found.")
-        return
-    db_conn = init_db()
-    cursor = db_conn.cursor()
-    logging.info("Starting synchronization cycle...")
-    with requests.Session() as session:
-        config_files = sorted([f for f in os.listdir(CONFIG_DIR) if f.endswith('.json')])
-        if not config_files:
-            logging.warning(f"No .json configuration files found in {CONFIG_DIR}")
-        for filename in config_files:
-            logging.info(f"Processing config file: {filename}")
-            process_config_file(session, os.path.join(CONFIG_DIR, filename), cursor, db_conn)
-    logging.info("Synchronization cycle completed.")
-    db_conn.close()
-
-
 if __name__ == "__main__":
-    sync_interval = int(os.getenv("SYNC_INTERVAL", "600"))
-    logging.info(f"Service started. Interval: {sync_interval}s")
+    interval = int(os.getenv("SYNC_INTERVAL", "600"))
+    logging.info(f"Service running (Interval: {interval}s, TZ: {TZ_NAME})")
     while True:
         try:
-            main()
+            engine.sync()
         except Exception as e:
-            logging.error(f"Main loop crashed but restarting: {e}")
-        time.sleep(sync_interval)
+            logging.error(f"Loop error: {e}")
+        time.sleep(interval)
