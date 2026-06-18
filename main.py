@@ -24,6 +24,7 @@ DEFAULT_PRIORITY = "3"
 USER_AGENT = os.getenv("USER_AGENT",
                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
+MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "400"))
 
 # Logging Setup
 class TZFormatter(logging.Formatter):
@@ -101,7 +102,8 @@ class FeedEngine:
             if img_tag and img_tag.get("src"): img_url = img_tag["src"]
 
         text = re.sub(r'\s+', ' ', soup.get_text(separator=" ")).strip()
-        return (text[:250] + '...') if len(text) > 250 else text, img_url
+
+        return (text[:MAX_MESSAGE_CHARS] + '...') if len(text) > MAX_MESSAGE_CHARS else text, img_url
 
     def send_ntfy(self, entry, f_conf, topic, priority, delay_str):
         title = entry.get("title", "No Title")
