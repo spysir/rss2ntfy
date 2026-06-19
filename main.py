@@ -24,7 +24,7 @@ DEFAULT_PRIORITY = "3"
 USER_AGENT = os.getenv("USER_AGENT",
                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "500"))
+MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "300"))
 
 # Logging Setup
 class TZFormatter(logging.Formatter):
